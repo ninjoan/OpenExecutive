@@ -14,14 +14,19 @@
 #                 api -> container port 8000  (public: Telegram webhook and the
 #                                              Google OAuth callback hit it)
 #
-# The build context is the repo root (`..`) because both Dockerfiles COPY from
-# packages/ and fixtures/, which live above this directory.
+# IMAGES ARE NOT BUILT HERE. .github/workflows/build-dokploy.yml builds both on
+# GitHub's native arm64 runners and pushes them to GHCR; this file only pulls.
+# There is deliberately no `build:` key: Dokploy invokes compose with --build,
+# so leaving one would rebuild the (very heavy) API image on the host anyway and
+# defeat the point. To change how an image is built, edit the Dockerfile and let
+# the workflow rebuild it.
+#
+# OPENEXEC_IMAGE_TAG defaults to `latest`. Set it in Dokploy's Environment tab
+# to a `sha-<short>` tag to pin or roll back to a specific build.
 
 services:
   api:
-    build:
-      context: ..
-      dockerfile: docker/Dockerfile
+    image: ghcr.io/ninjoan/openexecutive-api:${OPENEXEC_IMAGE_TAG:-latest}
     restart: unless-stopped
 
     # SINGLE INSTANCE — NOT NEGOTIABLE.
@@ -95,9 +100,7 @@ services:
       dokploy-network:
 
   ui:
-    build:
-      context: ..
-      dockerfile: docker/Dockerfile.ui
+    image: ghcr.io/ninjoan/openexecutive-ui:${OPENEXEC_IMAGE_TAG:-latest}
     restart: unless-stopped
 
     environment:

@@ -1,0 +1,198 @@
+# Build the API and UI images and publish them to GHCR for the Dokploy
+# deployment (docker/docker-compose.dokploy.yml pulls them by tag).
+#
+# Why images are built here rather than on the Dokploy host: the target box is
+# a 4-vCPU Ampere instance that also runs everything else on the server, and
+# the API image compiles/downloads torch (sentence-transformers) plus
+# onnxruntime (fastembed). Building on the host makes every deploy a multi-hour
+# CPU hog and couples deploy time to whatever else is running there.
+#
+# Runners are `ubuntu-24.04-arm` — GitHub's NATIVE arm64 hosted runners, free
+# on public repositories. This matters: the Dokploy host is aarch64, and the
+# alternative (buildx + QEMU emulation on an x86 runner) is roughly an order of
+# magnitude slower for a build this heavy. If this repo is ever made private,
+# these runners become billable — switch to a self-hosted arm64 runner or
+# accept QEMU rather than silently paying for it.
+
+name: Build images (Dokploy)
+
+on:
+  push:
+    branches: [deploy/dokploy]
+  workflow_dispatch:
+    inputs:
+      target:
+        description: "Which image to build"
+        required: true
+        default: "both"
+        type: choice
+        options: [both, api, ui]
+
+concurrency:
+  group: build-dokploy-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  # Hardcoded lowercase: GHCR rejects uppercase path segments, and
+  # `github.repository` here would expand to `ninjoan/OpenExecutive`.
+  IMAGE_API: ghcr.io/ninjoan/openexecutive-api
+  IMAGE_UI: ghcr.io/ninjoan/openexecutive-ui
+
+jobs:
+  changes:
+    name: Detect changed paths
+    runs-on: ubuntu-latest
+    outputs:
+      api: ${{ steps.filter.outputs.api }}
+      ui: ${{ steps.filter.outputs.ui }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 2
+      - id: filter
+        uses: dorny/paths-filter@v4
+        with:
+          filters: |
+            api:
+              - 'packages/core/**'
+              - 'knowledge/**'
+              # Fixtures live at the repo root and are baked into the API image
+              # (docker/Dockerfile COPYs fixtures/), so a fixtures-only change
+              # still needs a rebuild.
+              - 'fixtures/**'
+              - 'docker/Dockerfile'
+              - 'docker/workspace-mcp-launch.sh'
+              - '.github/workflows/build-dokploy.yml'
+            ui:
+              - 'packages/ui/**'
+              - 'docker/Dockerfile.ui'
+              - '.github/workflows/build-dokploy.yml'
+
+  build-api:
+    name: Build API image
+    needs: changes
+    if: >-
+      (github.event_name == 'workflow_dispatch' && (inputs.target == 'both' || inputs.target == 'api'))
+      || (github.event_name == 'push' && needs.changes.outputs.api == 'true')
+    runs-on: ubuntu-24.04-arm
+    concurrency:
+      group: build-dokploy-api
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE_API }}
+          # `latest` is what the compose file pulls by default; the sha tag is
+          # what you pin to when rolling back (set OPENEXEC_IMAGE_TAG in the
+          # Dokploy environment to `sha-<short>`).
+          tags: |
+            type=raw,value=latest
+            type=sha,format=short
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # The heavy layers here are the model bakes (sentence-transformers
+          # under HF_HOME, fastembed under FASTEMBED_CACHE_PATH). Caching them
+          # turns a cold ~30min build into a few minutes when only app code
+          # changed. mode=max keeps intermediate stages, which is what makes
+          # the dependency layer reusable.
+          cache-from: type=gha,scope=dokploy-api
+          cache-to: type=gha,mode=max,scope=dokploy-api
+
+  build-ui:
+    name: Build UI image
+    needs: changes
+    if: >-
+      (github.event_name == 'workflow_dispatch' && (inputs.target == 'both' || inputs.target == 'ui'))
+      || (github.event_name == 'push' && needs.changes.outputs.ui == 'true')
+    runs-on: ubuntu-24.04-arm
+    concurrency:
+      group: build-dokploy-ui
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE_UI }}
+          tags: |
+            type=raw,value=latest
+            type=sha,format=short
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile.ui
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=dokploy-ui
+          cache-to: type=gha,mode=max,scope=dokploy-ui
+
+  redeploy:
+    name: Trigger Dokploy redeploy
+    needs: [build-api, build-ui]
+    # `always()` plus the result check: a push that only touches the UI skips
+    # build-api, and a skipped needs-job would otherwise cancel this one. We
+    # redeploy if nothing FAILED and at least one image was actually built.
+    if: >-
+      always()
+      && needs.build-api.result != 'failure'
+      && needs.build-ui.result != 'failure'
+      && (needs.build-api.result == 'success' || needs.build-ui.result == 'success')
+    runs-on: ubuntu-latest
+    steps:
+      # Fail loud rather than let a green run imply a deploy that never
+      # happened — the same reasoning as the token preflight in deploy.yml.
+      - name: Preflight — webhook configured
+        run: |
+          if [ -z "${{ secrets.DOKPLOY_DEPLOY_WEBHOOK }}" ]; then
+            echo "::error::DOKPLOY_DEPLOY_WEBHOOK secret not set."
+            echo "Copy it from the Dokploy Compose service -> Deployments -> Webhook URL."
+            echo "NOTE: the panel sits behind Cloudflare Zero Trust Access, so the"
+            echo "webhook path needs a Bypass policy or this call gets a login page."
+            exit 1
+          fi
+
+      - name: Redeploy
+        run: |
+          code=$(curl -sS -X POST -o /tmp/body -w '%{http_code}' \
+            "${{ secrets.DOKPLOY_DEPLOY_WEBHOOK }}")
+          echo "HTTP $code"
+          cat /tmp/body
+          # Cloudflare Access answers an unauthenticated call with a 302 to its
+          # login page, which curl reports as a perfectly happy redirect. Treat
+          # anything that is not 2xx as a failure so that case is not silent.
+          case "$code" in
+            2*) ;;
+            *) echo "::error::Dokploy webhook returned $code (302 usually means Cloudflare Access blocked it)"; exit 1 ;;
+          esac
