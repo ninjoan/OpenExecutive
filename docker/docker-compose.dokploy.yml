@@ -1,0 +1,143 @@
+# Open Executive — self-hosted deployment for Dokploy (Docker Compose service).
+#
+# Differences from docker/docker-compose.yml (which is a LOCAL DEV file):
+#   - the UI is built from docker/Dockerfile.ui (Next.js standalone production
+#     build) instead of running `npm install && npm run dev` on a bind mount.
+#   - no host port publishing: Dokploy's Traefik reaches both services over the
+#     shared `dokploy-network`, so nothing is exposed on the host directly.
+#   - every value comes from Dokploy's Environment tab via ${VAR} interpolation
+#     rather than a repo-root .env file.
+#
+# Dokploy setup (Compose service):
+#   Compose Path: ./docker/docker-compose.dokploy.yml
+#   Domains:      ui  -> container port 3000
+#                 api -> container port 8000  (public: Telegram webhook and the
+#                                              Google OAuth callback hit it)
+#
+# The build context is the repo root (`..`) because both Dockerfiles COPY from
+# packages/ and fixtures/, which live above this directory.
+
+services:
+  api:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    restart: unless-stopped
+
+    # SINGLE INSTANCE — NOT NEGOTIABLE.
+    # The scheduler claims due actions with `UPDATE ... RETURNING`. Two
+    # replicas double-fire every scheduled action, which means duplicate
+    # outbound messages and double billing on the Anthropic API. Never raise
+    # this. See the same constraint in fly.api.toml.
+    deploy:
+      replicas: 1
+
+    environment:
+      # --- Fixed container paths (all state lives on the executive_data volume)
+      VECTOR_STORE_PATH: /data/chroma_db
+      COMPANY_PROFILE_PATH: /data/company/profile.yaml
+      EPISODIC_DB_PATH: /data/episodic_memory.db
+      MCP_SERVERS_CONFIG_PATH: /data/company/mcp_servers.json
+      WORKSPACE_MCP_CREDENTIALS_DIR: /data/google_credentials
+      WORKSPACE_MCP_TOOL_TIER: complete
+      ENABLE_CACHING: "true"
+      SCHEDULER_ENABLED: "true"
+      GWORKSPACE_AUTH_MODE: oauth
+
+      # --- Required: the API crash-loops on startup without these three.
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:?ANTHROPIC_API_KEY is required}
+      EXEC_EMAIL_ADDRESS: ${EXEC_EMAIL_ADDRESS:?EXEC_EMAIL_ADDRESS is required}
+      # Gates every non-exempt route via the x-api-key header, and must be the
+      # SAME value the ui service gets. api/main.py only hard-fails on a missing
+      # secret when FLY_APP_NAME is set — off Fly it would boot WIDE OPEN with
+      # just a warning, so the `:?` guard below is what fails the deploy here.
+      BACKEND_SHARED_SECRET: ${BACKEND_SHARED_SECRET:?BACKEND_SHARED_SECRET is required}
+
+      # CORS allowlist for browser calls. Must be the UI's public origin.
+      BACKEND_ALLOWED_ORIGINS: ${BACKEND_ALLOWED_ORIGINS:-https://exec.ninpartners.xyz}
+      USER_TIMEZONE: ${USER_TIMEZONE:-America/Santo_Domingo}
+
+      # --- Optional integrations: leave unset in Dokploy to keep them off.
+      # See .env.example for the full list and what each one does.
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_WEBHOOK_SECRET: ${TELEGRAM_WEBHOOK_SECRET:-}
+      GOOGLE_OAUTH_CLIENT_ID: ${GOOGLE_OAUTH_CLIENT_ID:-}
+      GOOGLE_OAUTH_CLIENT_SECRET: ${GOOGLE_OAUTH_CLIENT_SECRET:-}
+      SLACK_BOT_TOKEN: ${SLACK_BOT_TOKEN:-}
+      SLACK_APP_TOKEN: ${SLACK_APP_TOKEN:-}
+      SCHEDULED_ADMIN_TOKEN: ${SCHEDULED_ADMIN_TOKEN:-}
+
+    volumes:
+      - executive_data:/data
+
+    # The API image is python:3.11-slim without curl, so the health probe is a
+    # plain urllib call. start_period mirrors the 5m grace in fly.api.toml: the
+    # MCP gateway builds its tool-discovery index and Chroma loads before /health
+    # answers, and a cold boot on this box is not fast.
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=10)"
+      interval: 30s
+      timeout: 15s
+      retries: 3
+      start_period: 300s
+
+    networks:
+      internal:
+        # Distinctive alias: `dokploy-network` is shared by every app on this
+        # server, so a bare `api` hostname could collide with another project.
+        # BACKEND_BASE_URL below points at this name, not at `api`.
+        aliases:
+          - openexec-api
+      dokploy-network:
+
+  ui:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.ui
+    restart: unless-stopped
+
+    environment:
+      NODE_ENV: production
+      # Server-side hop only: the UI proxies backend traffic through its own
+      # /api/backend/[...path] route. Staying on the internal network keeps this
+      # call off the public internet entirely — the reason this deploy is one
+      # Compose service instead of two independent Dokploy applications.
+      BACKEND_BASE_URL: http://openexec-api:8000
+
+      # Auth.js — sign-in fails with MissingSecret if AUTH_SECRET is absent.
+      AUTH_SECRET: ${AUTH_SECRET:?AUTH_SECRET is required}
+      AUTH_GOOGLE_ID: ${AUTH_GOOGLE_ID:?AUTH_GOOGLE_ID is required}
+      AUTH_GOOGLE_SECRET: ${AUTH_GOOGLE_SECRET:?AUTH_GOOGLE_SECRET is required}
+      AUTH_URL: ${AUTH_URL:-https://exec.ninpartners.xyz}
+      # Required behind Traefik + Cloudflare: Auth.js must trust the forwarded
+      # host headers instead of the container's own hostname.
+      AUTH_TRUST_HOST: "true"
+      ALLOWED_EMAILS: ${ALLOWED_EMAILS:?ALLOWED_EMAILS is required}
+      # MUST be byte-identical to the api service's value above.
+      BACKEND_SHARED_SECRET: ${BACKEND_SHARED_SECRET:?BACKEND_SHARED_SECRET is required}
+
+    depends_on:
+      api:
+        condition: service_started
+
+    networks:
+      - internal
+      - dokploy-network
+
+volumes:
+  # chroma_db, episodic_memory.db, company/profile.yaml and the Google
+  # Workspace OAuth token all live here. Back this up before any redeploy that
+  # could recreate it.
+  executive_data:
+
+networks:
+  # Private to this Compose project: carries the ui -> api hop.
+  internal:
+  # Created by the Dokploy installer; Traefik must share it with any service
+  # that has a domain attached.
+  dokploy-network:
+    external: true
