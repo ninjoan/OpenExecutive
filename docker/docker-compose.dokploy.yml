@@ -73,6 +73,14 @@ services:
       BACKEND_ALLOWED_ORIGINS: ${BACKEND_ALLOWED_ORIGINS:-https://exec.ninpartners.xyz}
       USER_TIMEZONE: ${USER_TIMEZONE:-America/Santo_Domingo}
 
+      # Hard wall-clock cap on one chat turn. The 120s default cuts off
+      # genuinely complete work: a single specialist producing a ~18K-char
+      # deliverable measured 101s here, leaving too little for the Executive to
+      # synthesise, so the turn died after the expensive part had already been
+      # paid for. This is a single-tenant self-host — a long turn costs one held
+      # connection, while a truncated one costs the whole generation.
+      CHAT_STREAM_TIMEOUT_S: ${CHAT_STREAM_TIMEOUT_S:-360}
+
       # --- Optional integrations: leave unset in Dokploy to keep them off.
       # See .env.example for the full list and what each one does.
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
