@@ -240,14 +240,31 @@ jobs:
             args+=(-H "CF-Access-Client-Id: $CF_ACCESS_CLIENT_ID")
             args+=(-H "CF-Access-Client-Secret: $CF_ACCESS_CLIENT_SECRET")
           fi
+          # Dokploy's deploy endpoint expects a git-provider push payload: it
+          # reads `ref` and refuses with "Branch Not Match" unless the branch
+          # matches the one the service is configured to track. A bare POST
+          # carries no ref, so it never matches. Send the minimal GitHub-shaped
+          # push event for this branch.
+          args+=(-H "x-github-event: push")
+          args+=(-H "Content-Type: application/json")
+          args+=(--data "{\"ref\":\"refs/heads/${GITHUB_REF_NAME}\"}")
           code=$(curl "${args[@]}" "$WEBHOOK")
           echo "HTTP $code"
           cat /tmp/body
-          # Cloudflare Access answers an unauthenticated call with a 302 to its
-          # login page, which curl reports as a perfectly happy redirect. Treat
-          # anything that is not 2xx as a failure so that case is not silent.
+          echo
+          # Anything that is not 2xx is a failure. Both intermediaries answer
+          # with 3xx for different reasons, so the two are reported apart:
+          # Cloudflare Access redirects unauthenticated calls to its login page
+          # and returns HTML, while Dokploy returns 3xx with a JSON message for
+          # some of its own rejections.
           case "$code" in
             2*) ;;
-            30*) echo "::error::Webhook returned $code — Cloudflare Access redirected to its login page. The service token is wrong, or the path has no Bypass policy."; exit 1 ;;
+            3*)
+              if grep -q '"message"' /tmp/body 2>/dev/null; then
+                echo "::error::Dokploy rejected the webhook ($code) — see the message above."
+              else
+                echo "::error::Webhook returned $code with no Dokploy message — Cloudflare Access most likely redirected to its login page. Check the service token."
+              fi
+              exit 1 ;;
             *) echo "::error::Dokploy webhook returned $code"; exit 1 ;;
           esac
