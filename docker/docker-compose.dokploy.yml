@@ -21,12 +21,23 @@
 # defeat the point. To change how an image is built, edit the Dockerfile and let
 # the workflow rebuild it.
 #
-# OPENEXEC_IMAGE_TAG defaults to `latest`. Set it in Dokploy's Environment tab
-# to a `sha-<short>` tag to pin or roll back to a specific build.
+# Both services default to the `latest` tag and force a pull on every `up`.
+# Dokploy deploys with `docker compose up -d --build` and does NOT pass
+# `--pull always`, so without `pull_policy` compose reuses whatever image the
+# host already has under that tag — a moved `latest` in the registry is simply
+# ignored, and a deploy silently runs the previous build.
+#
+# To pin or roll back, set OPENEXEC_API_TAG and/or OPENEXEC_UI_TAG in Dokploy's
+# Environment tab to a `sha-<short>` tag. They are deliberately SEPARATE: the
+# build workflow is path-filtered, so a commit that only touched the UI
+# publishes `openexecutive-ui:sha-<commit>` and no matching api tag. A single
+# shared variable would resolve to an image that was never published and fail
+# the pull.
 
 services:
   api:
-    image: ghcr.io/ninjoan/openexecutive-api:${OPENEXEC_IMAGE_TAG:-latest}
+    image: ghcr.io/ninjoan/openexecutive-api:${OPENEXEC_API_TAG:-latest}
+    pull_policy: always
     restart: unless-stopped
 
     # SINGLE INSTANCE — NOT NEGOTIABLE.
@@ -100,7 +111,8 @@ services:
       dokploy-network:
 
   ui:
-    image: ghcr.io/ninjoan/openexecutive-ui:${OPENEXEC_IMAGE_TAG:-latest}
+    image: ghcr.io/ninjoan/openexecutive-ui:${OPENEXEC_UI_TAG:-latest}
+    pull_policy: always
     restart: unless-stopped
 
     environment:
