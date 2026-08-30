@@ -49,6 +49,7 @@ jobs:
     outputs:
       api: ${{ steps.filter.outputs.api }}
       ui: ${{ steps.filter.outputs.ui }}
+      compose: ${{ steps.filter.outputs.compose }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -71,6 +72,13 @@ jobs:
               - 'packages/ui/**'
               - 'docker/Dockerfile.ui'
               - '.github/workflows/build-dokploy.yml'
+            # The compose file is the deployment manifest: editing an env var,
+            # a healthcheck or a network changes what runs on the host without
+            # changing either image. Without this filter such a push builds
+            # nothing, so the redeploy job below would be skipped and the change
+            # would silently never reach the server.
+            compose:
+              - 'docker/docker-compose.dokploy.yml'
 
   build-api:
     name: Build API image
@@ -160,15 +168,24 @@ jobs:
 
   redeploy:
     name: Trigger Dokploy redeploy
-    needs: [build-api, build-ui]
-    # `always()` plus the result check: a push that only touches the UI skips
+    needs: [changes, build-api, build-ui]
+    # `always()` plus the result checks: a push that only touches the UI skips
     # build-api, and a skipped needs-job would otherwise cancel this one. We
-    # redeploy if nothing FAILED and at least one image was actually built.
+    # redeploy when nothing FAILED and there is something new to deploy —
+    # either a freshly built image, or a compose-file change that alters what
+    # runs on the host without rebuilding anything.
+    #
+    # This is the ONLY thing that deploys. Dokploy's own git trigger is
+    # deliberately off: it fires the moment the branch is pushed, which is
+    # while these builds are still running, so it would pull the previous
+    # `latest` and report a green deploy of stale images.
     if: >-
       always()
       && needs.build-api.result != 'failure'
       && needs.build-ui.result != 'failure'
-      && (needs.build-api.result == 'success' || needs.build-ui.result == 'success')
+      && (needs.build-api.result == 'success'
+          || needs.build-ui.result == 'success'
+          || needs.changes.outputs.compose == 'true')
     runs-on: ubuntu-latest
     steps:
       # Fail loud rather than let a green run imply a deploy that never
