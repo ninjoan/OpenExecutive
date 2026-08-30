@@ -57,6 +57,13 @@ jobs:
       - id: filter
         uses: dorny/paths-filter@v4
         with:
+          # Compare against the previous commit on THIS branch. Without an
+          # explicit base, paths-filter diffs against the repository default
+          # branch, and since deploy/dokploy permanently carries its own
+          # commits (this workflow, the compose file, the mcp pin) every filter
+          # matched on every push and nothing was ever skipped. Naming the same
+          # ref makes paths-filter use the push event's before-commit instead.
+          base: ${{ github.ref_name }}
           filters: |
             api:
               - 'packages/core/**'
