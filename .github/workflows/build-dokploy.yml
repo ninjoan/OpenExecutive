@@ -198,19 +198,49 @@ jobs:
       # Fail loud rather than let a green run imply a deploy that never
       # happened — the same reasoning as the token preflight in deploy.yml.
       - name: Preflight — webhook configured
+        env:
+          WEBHOOK: ${{ secrets.DOKPLOY_DEPLOY_WEBHOOK }}
+          CF_ACCESS_CLIENT_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
+          CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
         run: |
-          if [ -z "${{ secrets.DOKPLOY_DEPLOY_WEBHOOK }}" ]; then
+          if [ -z "$WEBHOOK" ]; then
             echo "::error::DOKPLOY_DEPLOY_WEBHOOK secret not set."
             echo "Copy it from the Dokploy Compose service -> Deployments -> Webhook URL."
-            echo "NOTE: the panel sits behind Cloudflare Zero Trust Access, so the"
-            echo "webhook path needs a Bypass policy or this call gets a login page."
+            echo "The panel sits behind Cloudflare Zero Trust Access, so the call must"
+            echo "get past Access too — either a Service Auth policy (set"
+            echo "CF_ACCESS_CLIENT_ID and CF_ACCESS_CLIENT_SECRET) or a Bypass policy"
+            echo "on the webhook path."
             exit 1
+          fi
+          # A half-configured service token silently degrades into an
+          # unauthenticated call, which Access answers with a login page. Refuse
+          # the pair rather than debug a 302 later.
+          if { [ -n "$CF_ACCESS_CLIENT_ID" ] && [ -z "$CF_ACCESS_CLIENT_SECRET" ]; } \
+            || { [ -z "$CF_ACCESS_CLIENT_ID" ] && [ -n "$CF_ACCESS_CLIENT_SECRET" ]; }; then
+            echo "::error::Set BOTH CF_ACCESS_CLIENT_ID and CF_ACCESS_CLIENT_SECRET, or neither."
+            exit 1
+          fi
+          if [ -n "$CF_ACCESS_CLIENT_ID" ]; then
+            echo "Cloudflare Access service token present — authenticating to Access."
+          else
+            echo "No service token — the webhook path must have an Access Bypass policy."
           fi
 
       - name: Redeploy
+        env:
+          WEBHOOK: ${{ secrets.DOKPLOY_DEPLOY_WEBHOOK }}
+          CF_ACCESS_CLIENT_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
+          CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
         run: |
-          code=$(curl -sS -X POST -o /tmp/body -w '%{http_code}' \
-            "${{ secrets.DOKPLOY_DEPLOY_WEBHOOK }}")
+          # Secrets travel via env, never inlined into the command, so the URL
+          # (which carries Dokploy's refresh token) stays out of the rendered
+          # script and any `set -x` style trace.
+          args=(-sS -X POST -o /tmp/body -w '%{http_code}')
+          if [ -n "$CF_ACCESS_CLIENT_ID" ]; then
+            args+=(-H "CF-Access-Client-Id: $CF_ACCESS_CLIENT_ID")
+            args+=(-H "CF-Access-Client-Secret: $CF_ACCESS_CLIENT_SECRET")
+          fi
+          code=$(curl "${args[@]}" "$WEBHOOK")
           echo "HTTP $code"
           cat /tmp/body
           # Cloudflare Access answers an unauthenticated call with a 302 to its
@@ -218,5 +248,6 @@ jobs:
           # anything that is not 2xx as a failure so that case is not silent.
           case "$code" in
             2*) ;;
-            *) echo "::error::Dokploy webhook returned $code (302 usually means Cloudflare Access blocked it)"; exit 1 ;;
+            30*) echo "::error::Webhook returned $code — Cloudflare Access redirected to its login page. The service token is wrong, or the path has no Bypass policy."; exit 1 ;;
+            *) echo "::error::Dokploy webhook returned $code"; exit 1 ;;
           esac
